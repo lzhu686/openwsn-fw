@@ -8,6 +8,19 @@ Import('env')
 
 localEnv = env.Clone()
 
+# Optional sensor drivers compiled as part of the board library
+bmx160 = localEnv.SConscript(
+    os.path.join('#', 'bsp', 'chips', 'bmx160', 'SConscript'),
+    variant_dir='bmx160',
+    exports={'env': env},
+)
+
+bmp388 = localEnv.SConscript(
+    os.path.join('#', 'bsp', 'chips', 'bmp388', 'SConscript'),
+    variant_dir='bmp388',
+    exports={'env': env},
+)
+
 #    Glob('sdk/components/proprietary_rf/esb/nrf_esb.c') + \
 #    Glob('sdk/components/libraries/timer/app_timer.c') + \
 
@@ -62,11 +75,13 @@ localEnv.Append(
         os.path.join('#','bsp','boards','nrf52840','sdk','modules','nrfx','soc'),
         os.path.join('#','bsp','boards','nrf52840','sdk','modules','nrfx','templates'),
         os.path.join('#','bsp','boards','nrf52840','sdk','components','drivers_nrf','radio_config'),
+        os.path.join('#','bsp','chips','bmx160'),
+        os.path.join('#','bsp','chips','bmp388'),
     ],
 )
 
 # print localEnv['CPPPATH']
 
-board  = localEnv.Object(source=source)
+board  = localEnv.Object(source=source) + bmx160 + bmp388
 
 Return('board')

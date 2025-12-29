@@ -26,7 +26,8 @@ TeraTerm):
 //=========================== defines =========================================
 
 #define SCTIMER_PERIOD     0xffff // 0xffff@32kHz = 2s
-uint8_t stringToSend[]       = "Hello, World!\r\n";
+#define APP_MAX_MSG_LEN    128
+static const uint8_t defaultMessage[] = "Hello, World!\r\n";
 
 //=========================== variables =======================================
 
@@ -34,6 +35,12 @@ typedef struct {
               uint8_t uart_lastTxByteIndex;
    volatile   uint8_t uartDone;
    volatile   uint8_t uartSendNow;
+          uint8_t txBuffer[APP_MAX_MSG_LEN];
+   volatile  uint8_t txLength;
+          uint8_t rxBuffer[APP_MAX_MSG_LEN];
+          uint8_t rxIndex;
+   volatile  uint8_t rxLength;
+   volatile  uint8_t newMsgReady;
 } app_vars_t;
 
 app_vars_t app_vars;
@@ -55,6 +62,8 @@ int mote_main(void) {
    memset(&app_vars,0,sizeof(app_vars_t));
     
    app_vars.uartSendNow = 1;
+   app_vars.txLength    = sizeof(defaultMessage)-1;
+   memcpy(app_vars.txBuffer, defaultMessage, app_vars.txLength);
    
    // initialize the board
    board_init();
@@ -74,9 +83,21 @@ int mote_main(void) {
       app_vars.uartSendNow = 0;
       
       // send string over UART
+      if (app_vars.newMsgReady) {
+         if (app_vars.rxLength > 0 && app_vars.rxLength <= APP_MAX_MSG_LEN) {
+            memcpy(app_vars.txBuffer, app_vars.rxBuffer, app_vars.rxLength);
+            app_vars.txLength = app_vars.rxLength;
+         }
+         app_vars.newMsgReady = 0;
+      }
+
+      if (app_vars.txLength == 0) {
+         continue;
+      }
+
       app_vars.uartDone              = 0;
       app_vars.uart_lastTxByteIndex  = 0;
-      uart_writeByte(stringToSend[app_vars.uart_lastTxByteIndex]);
+      uart_writeByte(app_vars.txBuffer[app_vars.uart_lastTxByteIndex]);
       while(app_vars.uartDone==0);
    }
 }
@@ -94,8 +115,8 @@ void cb_compare(void) {
 
 void cb_uartTxDone(void) {
    app_vars.uart_lastTxByteIndex++;
-   if (app_vars.uart_lastTxByteIndex<sizeof(stringToSend)) {
-      uart_writeByte(stringToSend[app_vars.uart_lastTxByteIndex]);
+   if (app_vars.uart_lastTxByteIndex<app_vars.txLength) {
+      uart_writeByte(app_vars.txBuffer[app_vars.uart_lastTxByteIndex]);
    } else {
       app_vars.uartDone = 1;
    }
@@ -110,8 +131,17 @@ uint8_t cb_uartRxCb(void) {
    // read received byte
    byte = uart_readByte();
    
-   // echo that byte over serial
-   uart_writeByte(byte);
-   
+   if (app_vars.rxIndex < APP_MAX_MSG_LEN) {
+      app_vars.rxBuffer[app_vars.rxIndex++] = byte;
+   } else {
+      app_vars.rxIndex = 0;
+   }
+
+   if (byte == '\n') {
+      app_vars.rxLength    = app_vars.rxIndex;
+      app_vars.rxIndex     = 0;
+      app_vars.newMsgReady = 1;
+   }
+
    return 0;
 }

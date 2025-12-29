@@ -13,6 +13,7 @@ settings
 *.pyc
 /build
 /images
+/lzhuTask
 /.sconsign.dblite
 *.map
 *.lst

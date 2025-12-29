@@ -17,21 +17,28 @@ end of frame event), it will turn on its error LED.
 \author Thomas Watteyne <watteyne@eecs.berkeley.edu>, August 2014.
 */
 
+#include <stdint.h>
+#include <string.h>
+
 #include "board.h"
 #include "radio.h"
 #include "leds.h"
 #include "sctimer.h"
 #include "uart.h"
+#include "i2c.h"
+#include "bmx160.h"
 
 //=========================== defines =========================================
 
-#define LENGTH_PACKET   125+LENGTH_CRC  ///< maximum length is 127 bytes
-#define LEN_PKT_TO_SEND 20+LENGTH_CRC
-#define CHANNEL         11             ///< 11=2.405GHz
-#define TIMER_PERIOD    (0xffff>>4)    ///< 0xffff = 2s@32kHz
-#define ID              0x99           ///< byte sent in the packets
-
-uint8_t stringToSend[]  = "+002 Ptest.24.00.12.-010\n";
+#define LENGTH_PACKET       (125+LENGTH_CRC) ///< maximum length is 127 bytes
+#define CHANNEL             11              ///< 11=2.405GHz
+#define ROLE_SENSOR_NODE    1               ///< set to 1 for sensor TX node, 0 for RX sink node
+#define SAMPLE_PERIOD       (32768>>4)      ///< timer ticks @32kHz (~62.5ms)
+#define GYRO_BYTES          6               ///< 3 axes * 2 bytes (big endian)
+#define RADIO_SEQ_BYTES     1
+#define RADIO_PAYLOAD_BYTES (RADIO_SEQ_BYTES + GYRO_BYTES)
+#define LEN_PKT_TO_SEND     (RADIO_PAYLOAD_BYTES + LENGTH_CRC)
+#define UART_FRAME_LEN      (GYRO_BYTES + 2) ///< raw gyro bytes + CRLF
 
 //=========================== variables =======================================
 
@@ -59,13 +66,14 @@ app_dbg_t app_dbg;
 
 typedef struct {
     volatile    uint8_t         uartDone;
-    volatile    uint8_t         uartSendNow;
                 uint8_t         uart_lastTxByteIndex;
+                uint8_t         uart_buffer[UART_FRAME_LEN];
 
                 uint8_t         flags;
                 app_state_t     state;
                 uint8_t         packet[LENGTH_PACKET];
                 uint8_t         packet_len;
+                uint8_t         tx_seq;
                 int8_t          rxpk_rssi;
                 uint8_t         rxpk_lqi;
                 bool            rxpk_crc;
@@ -88,12 +96,6 @@ uint8_t  cb_uart_rx(void);
 \brief The program starts executing here.
 */
 int mote_main(void) {
-    uint8_t i;
-
-    uint8_t freq_offset;
-    uint8_t sign;
-    uint8_t read;
-
     // clear local variables
     memset(&app_vars,0,sizeof(app_vars_t));
 
@@ -105,33 +107,38 @@ int mote_main(void) {
     uart_enableInterrupts();
 
     app_vars.uartDone = 1;
+    app_vars.tx_seq   = 0;
+
+#if ROLE_SENSOR_NODE
+    // configure BMX160 sensor (gyro at 3200Hz, +/-1000°/s like standalone example)
+    i2c_set_addr(BMX160_ADDR);
+    (void)bmx160_who_am_i();
+    bmx160_acc_config(0x0c);
+    bmx160_gyr_config(0x0d);
+    bmx160_mag_config(0x0b);
+    bmx160_acc_range(0x8);
+    bmx160_gyr_range(0x1);
+
+    // start periodic sampler timer
+    sctimer_set_callback(cb_timer);
+    sctimer_setCompare(sctimer_readCounter()+SAMPLE_PERIOD);
+    sctimer_enable();
+
+    // kick off first sample immediately
+    app_vars.flags |= APP_FLAG_TIMER;
+#endif
 
     // add callback functions radio
     radio_setStartFrameCb(cb_startFrame);
     radio_setEndFrameCb(cb_endFrame);
 
-    // prepare packet
-    app_vars.packet_len = sizeof(app_vars.packet);
-    for (i=0;i<app_vars.packet_len;i++) {
-        app_vars.packet[i] = ID;
-    }
-
-    // start bsp timer
-    sctimer_set_callback(cb_timer);
-    sctimer_setCompare(sctimer_readCounter()+TIMER_PERIOD);
-    sctimer_enable();
-
     // prepare radio
     radio_rfOn();
-    // freq type only effects on scum port
     radio_setFrequency(CHANNEL, FREQ_RX);
 
-    // switch in RX by default
     radio_rxEnable();
+    radio_rxNow();
     app_vars.state = APP_STATE_RX;
-
-    // start by a transmit
-    app_vars.flags |= APP_FLAG_TIMER;
 
     while (1) {
 
@@ -189,55 +196,19 @@ int mote_main(void) {
                             &app_vars.rxpk_lqi,
                             &app_vars.rxpk_crc
                         );
+#if !ROLE_SENSOR_NODE
+                        if (app_vars.rxpk_crc && app_vars.packet_len >= LEN_PKT_TO_SEND) {
+                            if (app_vars.uartDone) {
+                                memcpy(&app_vars.uart_buffer[0], &app_vars.packet[1], GYRO_BYTES);
+                                app_vars.uart_buffer[GYRO_BYTES]     = '\r';
+                                app_vars.uart_buffer[GYRO_BYTES + 1] = '\n';
 
-                        freq_offset = radio_getFrequencyOffset();
-                        sign = (freq_offset & 0x80) >> 7;
-                        if (sign){
-                            read = 0xff - (uint8_t)(freq_offset) + 1;
-                        } else {
-                            read = freq_offset;
+                                app_vars.uartDone             = 0;
+                                app_vars.uart_lastTxByteIndex = 0;
+                                uart_writeByte(app_vars.uart_buffer[app_vars.uart_lastTxByteIndex]);
+                            }
                         }
-
-                        i = 0;
-                        if (sign) {
-                            stringToSend[i++] = '-';
-                        } else {
-                            stringToSend[i++] = '+';
-                        }
-                        stringToSend[i++] = '0'+read/100;
-                        stringToSend[i++] = '0'+read/10;
-                        stringToSend[i++] = '0'+read%10;
-                        stringToSend[i++] = ' ';
-
-                        stringToSend[i++] = 'P';
-                        memcpy(&stringToSend[i],&app_vars.packet[0],14);
-                        i += 14;
-
-                        sign = (app_vars.rxpk_rssi & 0x80) >> 7;
-                        if (sign){
-                            read = 0xff - (uint8_t)(app_vars.rxpk_rssi) + 1;
-                        } else {
-                            read = app_vars.rxpk_rssi;
-                        }
-
-                        if (sign) {
-                            stringToSend[i++] = '-';
-                        } else {
-                            stringToSend[i++] = '+';
-                        }
-                        stringToSend[i++] = '0'+read/100;
-                        stringToSend[i++] = '0'+read/10;
-                        stringToSend[i++] = '0'+read%10;
-
-                        stringToSend[sizeof(stringToSend)-2] = '\r';
-                        stringToSend[sizeof(stringToSend)-1] = '\n';
-
-                        // send string over UART
-                        if (app_vars.uartDone == 1) {
-                            app_vars.uartDone              = 0;
-                            app_vars.uart_lastTxByteIndex  = 0;
-                            uart_writeByte(stringToSend[app_vars.uart_lastTxByteIndex]);
-                        }
+#endif
 
                         // led
                         leds_error_off();
@@ -263,29 +234,40 @@ int mote_main(void) {
             if (app_vars.flags & APP_FLAG_TIMER) {
                 // timer fired
 
+#if ROLE_SENSOR_NODE
                 if (app_vars.state==APP_STATE_RX) {
-                    // stop listening
+                    int16_t gyr_x;
+                    int16_t gyr_y;
+                    int16_t gyr_z;
+
+                    // stop listening during transmission
                     radio_rfOff();
 
-                    // prepare packet
-                    app_vars.packet_len = sizeof(app_vars.packet);
-                    i = 0;
-                    app_vars.packet[i++] = 't';
-                    app_vars.packet[i++] = 'e';
-                    app_vars.packet[i++] = 's';
-                    app_vars.packet[i++] = 't';
-                    app_vars.packet[i++] = CHANNEL;
-                    while (i<app_vars.packet_len) {
-                        app_vars.packet[i++] = ID;
-                    }
+                    // read latest gyro sample
+                    bmx160_read_9dof_data();
+                    gyr_x = bmx160_read_gyr_x();
+                    gyr_y = bmx160_read_gyr_y();
+                    gyr_z = bmx160_read_gyr_z();
 
-                    // start transmitting packet
-                    radio_loadPacket(app_vars.packet,LEN_PKT_TO_SEND);
+                    app_vars.packet_len = LEN_PKT_TO_SEND;
+                    app_vars.packet[0]  = app_vars.tx_seq;
+                    app_vars.packet[1]  = (uint8_t)((gyr_x >> 8) & 0xff);
+                    app_vars.packet[2]  = (uint8_t)(gyr_x & 0xff);
+                    app_vars.packet[3]  = (uint8_t)((gyr_y >> 8) & 0xff);
+                    app_vars.packet[4]  = (uint8_t)(gyr_y & 0xff);
+                    app_vars.packet[5]  = (uint8_t)((gyr_z >> 8) & 0xff);
+                    app_vars.packet[6]  = (uint8_t)(gyr_z & 0xff);
+
+                    // start transmitting packet with payload (sequence + gyro data)
+                    radio_loadPacket(app_vars.packet,RADIO_PAYLOAD_BYTES);
                     radio_txEnable();
                     radio_txNow();
 
+                    app_vars.tx_seq++;
+
                     app_vars.state = APP_STATE_TX;
                 }
+#endif
 
                 // clear flag
                 app_vars.flags &= ~APP_FLAG_TIMER;
@@ -321,19 +303,21 @@ void cb_endFrame(PORT_TIMER_WIDTH timestamp) {
 }
 
 void cb_timer(void) {
+#if ROLE_SENSOR_NODE
     // set flag
     app_vars.flags |= APP_FLAG_TIMER;
 
     // update debug stats
     app_dbg.num_timer++;
 
-    sctimer_setCompare(sctimer_readCounter()+TIMER_PERIOD);
+    sctimer_setCompare(sctimer_readCounter()+SAMPLE_PERIOD);
+#endif
 }
 
 void cb_uart_tx_done(void) {
     app_vars.uart_lastTxByteIndex++;
-    if (app_vars.uart_lastTxByteIndex<sizeof(stringToSend)) {
-        uart_writeByte(stringToSend[app_vars.uart_lastTxByteIndex]);
+    if (app_vars.uart_lastTxByteIndex<UART_FRAME_LEN) {
+        uart_writeByte(app_vars.uart_buffer[app_vars.uart_lastTxByteIndex]);
     } else {
         app_vars.uartDone = 1;
     }

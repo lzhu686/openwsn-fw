@@ -1,0 +1,8 @@
+Import('env')
+
+localEnv = env.Clone()
+
+source = ['bmx160.c']
+bmx160 = localEnv.Object(source=source)
+
+Return('bmx160')

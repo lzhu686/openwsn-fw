@@ -21,12 +21,15 @@ The sctimer is periodic, of period SCTIMER_PERIOD ticks. Each time it elapses:
 
 //=========================== defines =========================================
 
-#define SCTIMER_PERIOD     32768 // @32kHz = 1s
+#define SCTIMER_PERIOD     16384 // @32kHz = 0.5s
 
 //=========================== variables =======================================
 
 typedef struct {
    uint16_t num_compare;
+   uint8_t  led2_counter;
+   uint8_t  led3_counter;
+   uint8_t  led4_counter;
 } app_vars_t;
 
 app_vars_t app_vars;
@@ -60,12 +63,27 @@ void cb_compare(void) {
    // toggle pin
    debugpins_frame_toggle();
    
-   // toggle error led
-   leds_error_toggle();
-   
-   // increment counter
+   // toggle LEDs at their respective intervals
+   leds_error_toggle();                // LED1 every 0.5s
+
+   if (++app_vars.led2_counter >= 2) { // LED2 every 1s
+      leds_radio_toggle();
+      app_vars.led2_counter = 0;
+   }
+
+   if (++app_vars.led3_counter >= 3) { // LED3 every 1.5s
+      leds_sync_toggle();
+      app_vars.led3_counter = 0;
+   }
+
+   if (++app_vars.led4_counter >= 4) { // LED4 every 2s
+      leds_debug_toggle();
+      app_vars.led4_counter = 0;
+   }
+
+   // increment counter for bookkeeping
    app_vars.num_compare++;
-   
+
    // schedule again
    sctimer_setCompare(sctimer_readCounter()+SCTIMER_PERIOD);
 }
